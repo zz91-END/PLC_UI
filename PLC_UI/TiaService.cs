@@ -1,5 +1,5 @@
 ﻿// =====================================================================================
-//  TiaService.cs —— TIA Portal V19 Openness 核心逻辑封装
+//  TiaService.cs —— TIA Portal V19 Openness 核心逻辑封装（V0.2）
 //  -------------------------------------------------------------------------------------
 //  职责（全部在后台线程执行，界面不会卡死）：
 //    1. 把 SCL 文本写入本地文件（自动建目录，ANSI/GBK 无 BOM，避免中文乱码）
@@ -8,16 +8,12 @@
 //    4. ExternalSourceGroup.ExternalSources.CreateFromFile 导入 SCL 外部源
 //    5. GenerateBlocksFromSource(GenerateBlockOption.None) 生成程序块
 //    6. GetService<ICompilable>().Compile() 编译，并收集编译消息
+//    7. V0.2 新增：读取 PLC 变量表（Tag Table），供 AI 生成代码时复用真实变量
 //
 //  与之前控制台版本的区别：用 IProgress<string> 汇报进度，所有异常统一转换成
 //  TiaOperationResult.FailureMessage，界面层不需要引用任何 Siemens 类型。
 // =====================================================================================
 
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Text;
-using System.Threading.Tasks;
 using Siemens.Engineering;
 using Siemens.Engineering.Compiler;
 using Siemens.Engineering.HW;
@@ -25,6 +21,13 @@ using Siemens.Engineering.HW.Features;
 using Siemens.Engineering.SW;
 using Siemens.Engineering.SW.Blocks;
 using Siemens.Engineering.SW.ExternalSources;
+using Siemens.Engineering.SW.Tags;
+using System;
+using System.CodeDom.Compiler;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
 
 namespace PLC_UI
 {
@@ -86,6 +89,98 @@ namespace PLC_UI
             }
 
             return Task.Run(() => RunPipeline(sclSource, blockName, progress));
+        }
+
+        // =================================================================================
+        //  读取 PLC 变量表（V0.2 新增）
+        // =================================================================================
+        /// <summary>
+        /// 读取当前博图项目里 PLC 变量表的全部变量，格式 "变量名 : 数据类型"（如 "StartButton : Bool"）。
+        /// 该方法是同步阻塞的（内部会 Attach 博图、遍历 TagTable），在界面里请用
+        /// <see cref="GetPlcVariablesAsync"/> 以免卡死 UI。
+        /// 找不到 TIA / 项目 / PlcSoftware / 变量表时一律返回空列表，不抛异常。
+        /// </summary>
+        public List<string> GetPlcVariables()
+        {
+            List<string> variables = new List<string>();
+            TiaPortal tiaPortal = null;
+
+            try
+            {
+                tiaPortal = AttachToRunningTiaPortal(null);
+
+                Project project = GetFirstOpenProject(tiaPortal);
+
+                string ownerName;
+                PlcSoftware plcSoftware = FindPlcSoftware(project, out ownerName);
+                if (plcSoftware == null)
+                {
+                    return variables;
+                }
+
+                // PlcSoftware.TagTableGroup 是“PLC 变量表系统组”，下面是用户组（Groups）和变量表（TagTables）
+                PlcTagTableGroup rootGroup = plcSoftware.TagTableGroup;
+                if (rootGroup == null)
+                {
+                    return variables;
+                }
+
+                CollectVariables(rootGroup, variables);
+                return variables;
+            }
+            catch (Exception)
+            {
+                // 读取变量表属于辅助功能，任何失败都只返回空列表，不影响主流程
+                return variables;
+            }
+            finally
+            {
+                if (tiaPortal != null)
+                {
+                    try
+                    {
+                        tiaPortal.Dispose();
+                    }
+                    catch (Exception)
+                    {
+                        // 断开失败忽略
+                    }
+                }
+            }
+        }
+
+        /// <summary>后台线程版本（界面用 await 调用，不卡 UI）。</summary>
+        public Task<List<string>> GetPlcVariablesAsync()
+        {
+            return Task.Run(() => GetPlcVariables());
+        }
+
+        /// <summary>递归遍历变量表分组：先收集本组变量表，再递归子分组。</summary>
+        private static void CollectVariables(PlcTagTableGroup group, List<string> output)
+        {
+            if (group == null)
+            {
+                return;
+            }
+
+            foreach (PlcTagTable table in group.TagTables)
+            {
+                foreach (PlcTag tag in table.Tags)
+                {
+                    string dataType = tag.DataTypeName;
+                    if (string.IsNullOrEmpty(dataType))
+                    {
+                        dataType = "Unknown";
+                    }
+
+                    output.Add(tag.Name + " : " + dataType);
+                }
+            }
+
+            foreach (PlcTagTableGroup childGroup in group.Groups)
+            {
+                CollectVariables(childGroup, output);
+            }
         }
 
         // =================================================================================
