@@ -14,6 +14,11 @@
 //  TiaOperationResult.FailureMessage，界面层不需要引用任何 Siemens 类型。
 // =====================================================================================
 
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Threading.Tasks;
 using Siemens.Engineering;
 using Siemens.Engineering.Compiler;
 using Siemens.Engineering.HW;
@@ -22,12 +27,6 @@ using Siemens.Engineering.SW;
 using Siemens.Engineering.SW.Blocks;
 using Siemens.Engineering.SW.ExternalSources;
 using Siemens.Engineering.SW.Tags;
-using System;
-using System.CodeDom.Compiler;
-using System.Collections.Generic;
-using System.IO;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace PLC_UI
 {
@@ -62,6 +61,44 @@ namespace PLC_UI
         }
     }
 
+    /// <summary>
+    /// 一个待创建的 PLC 变量定义（由 Excel 行转换而来）。
+    /// </summary>
+    public sealed class TiaTagDefinition
+    {
+        /// <summary>变量名（必须已经是合法的 PLC 变量名，如 "Tag_1"，不能是 "111"）。</summary>
+        public string Name { get; set; }
+
+        /// <summary>数据类型名，如 "Bool"、"Int"、"Real"。</summary>
+        public string DataType { get; set; }
+
+        /// <summary>逻辑地址，如 "%I0.0"、" %Q0.0"（会自动 Trim）。</summary>
+        public string Address { get; set; }
+
+        /// <summary>注释（可空）。</summary>
+        public string Comment { get; set; }
+    }
+
+    /// <summary>
+    /// 批量创建 PLC 变量的结果：地址 → 最终变量名 的映射（如 %I0.0 → Tag_1）。
+    /// </summary>
+    public sealed class TiaTagCreationResult
+    {
+        /// <summary>是否整体成功（至少创建/复用一个变量即视为成功）。</summary>
+        public bool Succeeded { get; set; }
+
+        /// <summary>失败原因（Succeeded = false 时非空）。</summary>
+        public string FailureMessage { get; set; }
+
+        /// <summary>物理地址 → 最终 PLC 变量名（用于告诉 AI 用变量名做映射）。</summary>
+        public Dictionary<string, string> AddressToTagName { get; private set; }
+
+        public TiaTagCreationResult()
+        {
+            AddressToTagName = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
     /// <summary>把 SCL 源码导入运行中的 TIA Portal V19、生成块并编译。</summary>
     public sealed class TiaService
     {
@@ -81,14 +118,15 @@ namespace PLC_UI
         /// <param name="blockName">期望的块名，可为 null（由生成结果自动识别）。</param>
         /// <param name="progress">进度/日志回调（由界面用 Progress&lt;string&gt; 传入，自动回到 UI 线程）。</param>
         public Task<TiaOperationResult> ImportAndCompileAsync(string sclSource, string blockName,
-                                                              IProgress<string> progress)
+                                                              IProgress<string> progress,
+                                                              IList<string> extraBlockNamesToDelete = null)
         {
             if (string.IsNullOrWhiteSpace(sclSource))
             {
                 throw new ArgumentException("SCL 源码不能为空。", "sclSource");
             }
 
-            return Task.Run(() => RunPipeline(sclSource, blockName, progress));
+            return Task.Run(() => RunPipeline(sclSource, blockName, progress, extraBlockNamesToDelete));
         }
 
         // =================================================================================
@@ -155,6 +193,158 @@ namespace PLC_UI
             return Task.Run(() => GetPlcVariables());
         }
 
+        // =================================================================================
+        //  在“默认变量表”里创建变量（V0.4 新增：Excel 导入时先把点位建进 PLC 变量表）
+        // =================================================================================
+        /// <summary>
+        /// 在后台线程把 Excel 点位创建到 PLC 的默认变量表里，返回 地址 → 变量名 映射。
+        /// 已存在的同名变量会跳过（并沿用它的名字）；不会抛出业务异常，失败原因在
+        /// <see cref="TiaTagCreationResult.FailureMessage"/>。
+        /// </summary>
+        public Task<TiaTagCreationResult> CreateTagsAsync(IList<TiaTagDefinition> definitions,
+                                                          IProgress<string> progress)
+        {
+            if (definitions == null || definitions.Count == 0)
+            {
+                TiaTagCreationResult empty = new TiaTagCreationResult();
+                empty.Succeeded = true;
+                return Task.FromResult(empty);
+            }
+
+            return Task.Run(() => RunCreateTags(definitions, progress));
+        }
+
+        /// <summary>创建变量的同步实现（后台线程里跑）。</summary>
+        private TiaTagCreationResult RunCreateTags(IList<TiaTagDefinition> definitions,
+                                                  IProgress<string> progress)
+        {
+            TiaTagCreationResult result = new TiaTagCreationResult();
+            TiaPortal tiaPortal = null;
+
+            try
+            {
+                tiaPortal = AttachToRunningTiaPortal(progress);
+
+                Project project = GetFirstOpenProject(tiaPortal);
+
+                string ownerName;
+                PlcSoftware plcSoftware = FindPlcSoftware(project, out ownerName);
+                if (plcSoftware == null)
+                {
+                    throw new InvalidOperationException("没有找到任何 PlcSoftware，无法创建变量。");
+                }
+
+                Report(progress, "      PlcSoftware 来源：" + ownerName + " → " + plcSoftware.Name);
+
+                PlcTagTable defaultTable = GetDefaultTagTable(plcSoftware);
+                Report(progress, "      目标变量表：" + defaultTable.Name + "（IsDefault=" + defaultTable.IsDefault + "）");
+
+                int created = 0;
+                int skipped = 0;
+
+                for (int i = 0; i < definitions.Count; i++)
+                {
+                    TiaTagDefinition definition = definitions[i];
+                    if (definition == null || string.IsNullOrWhiteSpace(definition.Name))
+                    {
+                        continue;
+                    }
+
+                    string name = definition.Name.Trim();
+                    string address = (definition.Address ?? string.Empty).Trim();
+
+                    try
+                    {
+                        if (defaultTable.Tags.Find(name) != null)
+                        {
+                            Report(progress, "      [已存在] " + name + " @ " + address + "（跳过创建，沿用原变量）");
+                            result.AddressToTagName[address] = name;
+                            skipped++;
+                            continue;
+                        }
+
+                        PlcTag tag = defaultTable.Tags.Create(name, definition.DataType, address);
+                        if (tag == null)
+                        {
+                            throw new InvalidOperationException("变量表返回了 null，创建失败。");
+                        }
+
+                        result.AddressToTagName[address] = name;
+                        created++;
+                        Report(progress, "      √ 创建变量：" + name + " : " + definition.DataType + " @ " + address);
+                    }
+                    catch (Exception ex)
+                    {
+                        Report(progress, "      [失败] 创建变量 " + name + " 失败：" + FormatException(ex));
+                    }
+                }
+
+                Report(progress, "      变量创建完成：新建 " + created + " 个，已存在跳过 " + skipped + " 个。");
+
+                result.Succeeded = created + skipped > 0;
+                if (!result.Succeeded)
+                {
+                    result.FailureMessage = "没有任何变量被创建成功，请检查 Excel 的地址/类型是否合法。";
+                }
+
+                return result;
+            }
+            catch (Exception ex)
+            {
+                result.Succeeded = false;
+                result.FailureMessage = FormatException(ex) + Environment.NewLine
+                    + "建议检查：1) 博图已打开目标项目；2) Openness 连接弹窗点了“是”；3) 当前用户属于“Siemens TIA Openness”用户组。";
+                Report(progress, "❌ 创建变量失败：" + result.FailureMessage);
+                return result;
+            }
+            finally
+            {
+                if (tiaPortal != null)
+                {
+                    try
+                    {
+                        tiaPortal.Dispose();
+                    }
+                    catch (Exception)
+                    {
+                        // 断开失败忽略
+                    }
+                }
+            }
+        }
+
+        /// <summary>找到 PLC 的默认变量表（IsDefault = true）；没有就退化为第一张变量表。</summary>
+        private static PlcTagTable GetDefaultTagTable(PlcSoftware plcSoftware)
+        {
+            PlcTagTableGroup rootGroup = plcSoftware.TagTableGroup;
+            if (rootGroup == null)
+            {
+                throw new InvalidOperationException("当前 PlcSoftware 没有变量表（TagTableGroup 为空）。");
+            }
+
+            PlcTagTable firstTable = null;
+
+            foreach (PlcTagTable table in rootGroup.TagTables)
+            {
+                if (firstTable == null)
+                {
+                    firstTable = table;
+                }
+
+                if (table.IsDefault)
+                {
+                    return table;
+                }
+            }
+
+            if (firstTable != null)
+            {
+                return firstTable;
+            }
+
+            throw new InvalidOperationException("PLC 里没有任何变量表，请先在博图里创建一张变量表。");
+        }
+
         /// <summary>递归遍历变量表分组：先收集本组变量表，再递归子分组。</summary>
         private static void CollectVariables(PlcTagTableGroup group, List<string> output)
         {
@@ -186,7 +376,8 @@ namespace PLC_UI
         // =================================================================================
         //  主流程
         // =================================================================================
-        private TiaOperationResult RunPipeline(string sclSource, string blockName, IProgress<string> progress)
+        private TiaOperationResult RunPipeline(string sclSource, string blockName, IProgress<string> progress,
+                                               IList<string> extraBlockNamesToDelete)
         {
             TiaOperationResult result = new TiaOperationResult();
             TiaPortal tiaPortal = null;
@@ -219,6 +410,9 @@ namespace PLC_UI
                 }
 
                 Report(progress, "      PlcSoftware 来源：" + ownerName + " → " + plcSoftware.Name);
+
+                // 批量模式：先把本次要重新生成的块（DB + 各 FB）全部删掉，避免“块已存在”导致导入失败
+                DeleteExistingBlocks(plcSoftware, blockName, extraBlockNamesToDelete, progress);
 
                 // ---------- 4. 导入外部源并生成块 ----------
                 Report(progress, "[4/5] 导入 SCL 外部源并生成程序块");
@@ -447,6 +641,45 @@ namespace PLC_UI
             catch (EngineeringException)
             {
                 return null;
+            }
+        }
+
+        /// <summary>批量模式用：在导入前删掉本次要重新生成的块（如 DB_Variables + 各 FB），避免“块已存在”导致导入失败。</summary>
+        private static void DeleteExistingBlocks(PlcSoftware plcSoftware, string blockName,
+                                                 IList<string> extraBlockNames, IProgress<string> progress)
+        {
+            if (extraBlockNames == null || extraBlockNames.Count == 0)
+            {
+                return;
+            }
+
+            for (int i = 0; i < extraBlockNames.Count; i++)
+            {
+                string name = extraBlockNames[i];
+                if (string.IsNullOrEmpty(name))
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrEmpty(blockName) && string.Equals(name, blockName, StringComparison.Ordinal))
+                {
+                    // 主块名由 GenerateBlock 负责删除
+                    continue;
+                }
+
+                try
+                {
+                    PlcBlock existingBlock = plcSoftware.BlockGroup.Blocks.Find(name);
+                    if (existingBlock != null)
+                    {
+                        existingBlock.Delete();
+                        Report(progress, "      已删除旧块（批量覆盖）：" + name);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Report(progress, "      警告：删除旧块 " + name + " 失败（" + ex.Message + "），继续。");
+                }
             }
         }
 
